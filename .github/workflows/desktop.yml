@@ -1,0 +1,43 @@
+name: Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Require desktop password
+        env:
+          DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
+        run: |
+          if [ -z "$DESKTOP_PASSWORD" ]; then
+            echo "::error::Set the repository Actions secret DESKTOP_PASSWORD before starting the desktop."
+            exit 1
+          fi
+
+      - name: Start Ubuntu XFCE desktop
+        background: true
+        env:
+          DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
+        run: |
+          docker run -d \
+            --name webtop \
+            --network host \
+            --shm-size=1gb \
+            -e CUSTOM_USER=admin \
+            -e PASSWORD="$DESKTOP_PASSWORD" \
+            -e TZ=Asia/Tokyo \
+            -e LC_ALL=ja_JP.UTF-8 \
+            lscr.io/linuxserver/webtop:ubuntu-xfce
+
+      - name: Desktop URL
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb >/dev/null 2>&1
+          echo "The temporary desktop URL will appear below."
+          cloudflared tunnel --url http://localhost:3000
