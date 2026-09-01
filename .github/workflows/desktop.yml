@@ -2,6 +2,12 @@ name: Desktop
 
 on:
   workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: Minutes to keep the desktop tunnel open
+        required: false
+        default: '340'
+        type: string
   schedule:
     - cron: '17 */6 * * *'
 
@@ -112,13 +118,13 @@ jobs:
 
           sudo tee /etc/systemd/system/desktop-novnc.service >/dev/null <<'EOF'
           [Unit]
-          Description=Ephemeral noVNC bridge
+          Description=Ephemeral noVNC websocket bridge
           Requires=desktop-x.service
           After=desktop-x.service
 
           [Service]
           Type=simple
-          ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901
+          ExecStart=/usr/bin/websockify 127.0.0.1:6080 127.0.0.1:5901
           Restart=on-failure
 
           [Install]
@@ -135,16 +141,22 @@ jobs:
               auth_basic_user_file /etc/nginx/.desktop-htpasswd;
 
               location = / {
-                  return 302 /vnc.html?autoconnect=true&resize=remote;
+                  return 302 /vnc.html?autoconnect=true&resize=remote&path=websockify;
               }
 
-              location / {
+              location /websockify {
                   proxy_pass http://127.0.0.1:6080;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
                   proxy_set_header Host $host;
+                  proxy_buffering off;
                   proxy_read_timeout 3600s;
+              }
+
+              location / {
+                  root /usr/share/novnc;
+                  try_files $uri $uri/ =404;
               }
           }
           EOF
@@ -157,13 +169,76 @@ jobs:
           sudo systemctl start desktop-x.service desktop-xfce.service desktop-novnc.service
 
           for attempt in {1..30}; do
-            if curl -fsSI -u "admin:${DESKTOP_PASSWORD}" http://127.0.0.1:3000/vnc.html >/dev/null; then
+            if curl -fsS -u "admin:${DESKTOP_PASSWORD}" \
+              http://127.0.0.1:3000/vnc.html >/dev/null; then
               exit 0
             fi
             sleep 1
           done
 
           sudo systemctl status desktop-x.service desktop-xfce.service desktop-novnc.service nginx --no-pager -l || true
+          exit 1
+
+      - name: Verify noVNC path
+        env:
+          DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          curl -fsS -u "admin:${DESKTOP_PASSWORD}" \
+            http://127.0.0.1:3000/vnc.html >/dev/null
+          curl -fsS -u "admin:${DESKTOP_PASSWORD}" \
+            http://127.0.0.1:3000/app/ui.js >/dev/null
+
+          python3 - <<'PY'
+          import socket
+          s = socket.create_connection(("127.0.0.1", 5901), timeout=5)
+          banner = s.recv(12)
+          s.close()
+          if not banner.startswith(b"RFB "):
+              raise SystemExit(f"unexpected VNC banner: {banner!r}")
+          print(banner.decode("ascii", errors="replace").strip())
+          PY
+
+          BASIC_AUTH="$(printf 'admin:%s' "$DESKTOP_PASSWORD" | base64 -w0)"
+          BASIC_AUTH="$BASIC_AUTH" python3 - <<'PY'
+          import base64
+          import os
+          import socket
+
+          key = base64.b64encode(os.urandom(16)).decode("ascii")
+          auth = os.environ["BASIC_AUTH"]
+          request = (
+              "GET /websockify HTTP/1.1\r\n"
+              "Host: 127.0.0.1\r\n"
+              "Upgrade: websocket\r\n"
+              "Connection: Upgrade\r\n"
+              f"Sec-WebSocket-Key: {key}\r\n"
+              "Sec-WebSocket-Version: 13\r\n"
+              f"Authorization: Basic {auth}\r\n"
+              "\r\n"
+          ).encode("ascii")
+
+          s = socket.create_connection(("127.0.0.1", 3000), timeout=5)
+          s.sendall(request)
+          response = s.recv(4096)
+          s.close()
+          status = response.split(b"\r\n", 1)[0]
+          print(status.decode("ascii", errors="replace"))
+          if b" 101 " not in status:
+              raise SystemExit(f"websocket upgrade failed: {status!r}")
+          PY
+
+          for attempt in {1..30}; do
+            if pgrep -u "$(id -u)" -f xfce4-session >/dev/null && \
+               pgrep -u "$(id -u)" -f xfwm4 >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          ps -ef | grep -E 'xfce4-session|xfwm4|xfdesktop|xfce4-panel' | grep -v grep || true
+          sudo journalctl -u desktop-xfce.service --no-pager -n 100 || true
           exit 1
 
       - name: Install k3s on hosted VM
@@ -248,11 +323,24 @@ jobs:
         background: true
 
       - name: Desktop URL
+        env:
+          HOLD_MINUTES: ${{ inputs.hold_minutes || '340' }}
         run: |
+          set -euo pipefail
+          case "$HOLD_MINUTES" in
+            ''|*[!0-9]*) echo "::error::hold_minutes must be an integer"; exit 1 ;;
+          esac
+          if [ "$HOLD_MINUTES" -lt 1 ] || [ "$HOLD_MINUTES" -gt 340 ]; then
+            echo "::error::hold_minutes must be between 1 and 340"
+            exit 1
+          fi
+
           echo "The temporary desktop URL will appear below."
           echo "Authenticate with user: admin"
+          echo "Manual branch smoke: choose this branch and set hold_minutes=10."
           set +e
-          timeout --signal=TERM 340m cloudflared tunnel --url http://127.0.0.1:3000
+          timeout --signal=TERM "${HOLD_MINUTES}m" \
+            cloudflared tunnel --url http://127.0.0.1:3000
           status=$?
           set -e
           if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
@@ -276,7 +364,7 @@ jobs:
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "https://api.github.com/repos/${RUNNER_TARGET_REPOSITORY}/actions/runners/remove-token" \
             | jq -r '.token')"
-          ./config.sh remove --unattended --token "$REMOVE_TOKEN"
+          ./config.sh remove --token "$REMOVE_TOKEN"
 
       - name: Stop development services
         if: always()
