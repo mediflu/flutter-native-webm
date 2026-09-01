@@ -2,6 +2,8 @@ name: Desktop
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
 
 permissions:
   contents: read
@@ -13,7 +15,7 @@ concurrency:
 jobs:
   desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 360
     steps:
       - name: Require secrets
         env:
@@ -26,19 +28,179 @@ jobs:
           test -n "$RUNNER_TARGET_REPOSITORY" || { echo "::error::Missing RUNNER_TARGET_REPOSITORY"; exit 1; }
           test -n "$RUNNER_ADMIN_TOKEN" || { echo "::error::Missing RUNNER_ADMIN_TOKEN"; exit 1; }
 
-      - name: Start Ubuntu XFCE desktop
+      - name: Install native desktop and development tools
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            apache2-utils \
+            ca-certificates \
+            curl \
+            dbus-x11 \
+            fonts-noto-cjk \
+            jq \
+            nginx \
+            novnc \
+            thunar \
+            tigervnc-standalone-server \
+            websockify \
+            wget \
+            xfce4-panel \
+            xfce4-session \
+            xfce4-terminal \
+            xfdesktop4 \
+            xfwm4
+
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            curl -fsSL \
+              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+              -o /tmp/google-chrome.deb
+            sudo apt-get install -y /tmp/google-chrome.deb
+          fi
+
+          if ! command -v code >/dev/null 2>&1; then
+            curl -fL \
+              https://update.code.visualstudio.com/latest/linux-deb-x64/stable \
+              -o /tmp/vscode.deb
+            sudo apt-get install -y /tmp/vscode.deb
+          fi
+
+      - name: Configure native XFCE desktop
         env:
           DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
         run: |
-          docker run -d \
-            --name webtop \
-            --network host \
-            --shm-size=1gb \
-            -e CUSTOM_USER=admin \
-            -e PASSWORD="$DESKTOP_PASSWORD" \
-            -e TZ=Asia/Tokyo \
-            -e LC_ALL=ja_JP.UTF-8 \
-            lscr.io/linuxserver/webtop:ubuntu-xfce
+          set -euo pipefail
+
+          DESKTOP_USER="$(id -un)"
+          DESKTOP_HOME="$HOME"
+
+          sudo tee /etc/systemd/system/desktop-x.service >/dev/null <<EOF
+          [Unit]
+          Description=Ephemeral desktop X server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=${DESKTOP_USER}
+          Environment=HOME=${DESKTOP_HOME}
+          ExecStart=/usr/bin/Xtigervnc :1 -localhost yes -rfbport 5901 -SecurityTypes None -geometry 1920x1080 -depth 24 -AlwaysShared
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo tee /etc/systemd/system/desktop-xfce.service >/dev/null <<EOF
+          [Unit]
+          Description=Ephemeral XFCE session
+          Requires=desktop-x.service
+          After=desktop-x.service
+
+          [Service]
+          Type=simple
+          User=${DESKTOP_USER}
+          Environment=HOME=${DESKTOP_HOME}
+          Environment=DISPLAY=:1
+          ExecStart=/usr/bin/dbus-run-session -- /usr/bin/startxfce4
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo tee /etc/systemd/system/desktop-novnc.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Ephemeral noVNC bridge
+          Requires=desktop-x.service
+          After=desktop-x.service
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo htpasswd -bc /etc/nginx/.desktop-htpasswd admin "$DESKTOP_PASSWORD" >/dev/null
+          sudo tee /etc/nginx/sites-available/desktop >/dev/null <<'EOF'
+          server {
+              listen 127.0.0.1:3000;
+              server_name _;
+
+              auth_basic "Development desktop";
+              auth_basic_user_file /etc/nginx/.desktop-htpasswd;
+
+              location = / {
+                  return 302 /vnc.html?autoconnect=true&resize=remote;
+              }
+
+              location / {
+                  proxy_pass http://127.0.0.1:6080;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_read_timeout 3600s;
+              }
+          }
+          EOF
+
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo ln -sf /etc/nginx/sites-available/desktop /etc/nginx/sites-enabled/desktop
+          sudo nginx -t
+          sudo systemctl daemon-reload
+          sudo systemctl restart nginx
+          sudo systemctl start desktop-x.service desktop-xfce.service desktop-novnc.service
+
+          for attempt in {1..30}; do
+            if curl -fsSI -u "admin:${DESKTOP_PASSWORD}" http://127.0.0.1:3000/vnc.html >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          sudo systemctl status desktop-x.service desktop-xfce.service desktop-novnc.service nginx --no-pager -l || true
+          exit 1
+
+      - name: Install k3s on hosted VM
+        run: |
+          set -euo pipefail
+
+          curl -sfL https://get.k3s.io | \
+            sudo env INSTALL_K3S_EXEC="server --write-kubeconfig-mode=644" sh -
+
+          mkdir -p "$HOME/.kube"
+          sudo cp /etc/rancher/k3s/k3s.yaml "$HOME/.kube/config"
+          sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+          for attempt in {1..60}; do
+            if KUBECONFIG="$HOME/.kube/config" kubectl get nodes 2>/dev/null | grep -q ' Ready'; then
+              break
+            fi
+            sleep 2
+          done
+
+          KUBECONFIG="$HOME/.kube/config" kubectl wait \
+            --for=condition=Ready node --all --timeout=120s
+
+          echo 'export KUBECONFIG="$HOME/.kube/config"' >> "$HOME/.profile"
+
+      - name: Verify development host
+        run: |
+          set -euo pipefail
+          google-chrome --version
+          code --version | head -n 1
+          sudo systemctl is-active k3s
+          KUBECONFIG="$HOME/.kube/config" kubectl get nodes -o wide
+          sudo systemctl is-active desktop-x.service
+          sudo systemctl is-active desktop-xfce.service
+          sudo systemctl is-active desktop-novnc.service
+          sudo systemctl is-active nginx
 
       - name: Install Cloudflare Tunnel
         run: |
@@ -88,8 +250,9 @@ jobs:
       - name: Desktop URL
         run: |
           echo "The temporary desktop URL will appear below."
+          echo "Authenticate with user: admin"
           set +e
-          timeout --signal=TERM 350m cloudflared tunnel --url http://localhost:3000
+          timeout --signal=TERM 340m cloudflared tunnel --url http://127.0.0.1:3000
           status=$?
           set -e
           if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
@@ -115,6 +278,7 @@ jobs:
             | jq -r '.token')"
           ./config.sh remove --unattended --token "$REMOVE_TOKEN"
 
-      - name: Stop desktop
+      - name: Stop development services
         if: always()
-        run: docker rm -f webtop >/dev/null 2>&1 || true
+        run: |
+          sudo systemctl stop desktop-novnc.service desktop-xfce.service desktop-x.service nginx k3s 2>/dev/null || true
