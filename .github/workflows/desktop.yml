@@ -76,7 +76,7 @@ jobs:
             --url "https://github.com/${RUNNER_TARGET_REPOSITORY}" \
             --token "$REGISTRATION_TOKEN" \
             --name flutter-native-webm-desktop \
-            --labels nijica-webm,ephemeral-linux \
+            --labels webm-integration,ephemeral-linux \
             --work _work
 
       - name: Start target repository runner
