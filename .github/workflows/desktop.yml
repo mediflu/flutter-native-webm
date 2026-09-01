@@ -6,22 +6,27 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: desktop
+  cancel-in-progress: false
+
 jobs:
   desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
     steps:
-      - name: Require desktop password
+      - name: Require secrets
         env:
           DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
+          RUNNER_TARGET_REPOSITORY: ${{ secrets.RUNNER_TARGET_REPOSITORY }}
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
         run: |
-          if [ -z "$DESKTOP_PASSWORD" ]; then
-            echo "::error::Set the repository Actions secret DESKTOP_PASSWORD before starting the desktop."
-            exit 1
-          fi
+          set -euo pipefail
+          test -n "$DESKTOP_PASSWORD" || { echo "::error::Missing DESKTOP_PASSWORD"; exit 1; }
+          test -n "$RUNNER_TARGET_REPOSITORY" || { echo "::error::Missing RUNNER_TARGET_REPOSITORY"; exit 1; }
+          test -n "$RUNNER_ADMIN_TOKEN" || { echo "::error::Missing RUNNER_ADMIN_TOKEN"; exit 1; }
 
       - name: Start Ubuntu XFCE desktop
-        background: true
         env:
           DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
         run: |
@@ -35,9 +40,81 @@ jobs:
             -e LC_ALL=ja_JP.UTF-8 \
             lscr.io/linuxserver/webtop:ubuntu-xfce
 
-      - name: Desktop URL
+      - name: Install Cloudflare Tunnel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared-linux-amd64.deb >/dev/null 2>&1
+
+      - name: Configure target repository runner
+        env:
+          RUNNER_TARGET_REPOSITORY: ${{ secrets.RUNNER_TARGET_REPOSITORY }}
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          RUNNER_VERSION="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name | ltrimstr("v")')"
+          RUNNER_DIR="$RUNNER_TEMP/target-runner"
+          mkdir -p "$RUNNER_DIR"
+          cd "$RUNNER_DIR"
+
+          curl -fsSL -o actions-runner.tar.gz \
+            "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+          tar xzf actions-runner.tar.gz
+
+          REGISTRATION_TOKEN="$(curl -fsSL \
+            -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${RUNNER_ADMIN_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "https://api.github.com/repos/${RUNNER_TARGET_REPOSITORY}/actions/runners/registration-token" \
+            | jq -r '.token')"
+
+          ./config.sh \
+            --unattended \
+            --replace \
+            --disableupdate \
+            --url "https://github.com/${RUNNER_TARGET_REPOSITORY}" \
+            --token "$REGISTRATION_TOKEN" \
+            --name flutter-native-webm-desktop \
+            --labels nijica-webm,ephemeral-linux \
+            --work _work
+
+      - name: Start target repository runner
+        id: target-runner
+        working-directory: ${{ runner.temp }}/target-runner
+        run: ./run.sh
+        background: true
+
+      - name: Desktop URL
+        run: |
           echo "The temporary desktop URL will appear below."
-          cloudflared tunnel --url http://localhost:3000
+          set +e
+          timeout --signal=TERM 350m cloudflared tunnel --url http://localhost:3000
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            exit "$status"
+          fi
+
+      - cancel: target-runner
+
+      - name: Remove target repository runner registration
+        if: always()
+        working-directory: ${{ runner.temp }}/target-runner
+        env:
+          RUNNER_TARGET_REPOSITORY: ${{ secrets.RUNNER_TARGET_REPOSITORY }}
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          set +e
+          REMOVE_TOKEN="$(curl -fsSL \
+            -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${RUNNER_ADMIN_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "https://api.github.com/repos/${RUNNER_TARGET_REPOSITORY}/actions/runners/remove-token" \
+            | jq -r '.token')"
+          ./config.sh remove --unattended --token "$REMOVE_TOKEN"
+
+      - name: Stop desktop
+        if: always()
+        run: docker rm -f webtop >/dev/null 2>&1 || true
