@@ -409,6 +409,7 @@ jobs:
 
       - name: Desktop URL
         env:
+          DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
           HOLD_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.hold_minutes || '10' }}
         run: |
           set -euo pipefail
@@ -420,17 +421,140 @@ jobs:
             exit 1
           fi
 
-          echo "The temporary desktop URL will appear below."
-          echo "Authenticate with user: admin"
-          echo "Manual branch smoke: choose this branch and set hold_minutes=10."
-          set +e
-          timeout --signal=TERM "${HOLD_MINUTES}m" \
-            cloudflared tunnel --url http://127.0.0.1:3000
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
-            exit "$status"
+          tunnel_log="$RUNNER_TEMP/cloudflared-quick-tunnel.log"
+          : > "$tunnel_log"
+
+          # noVNC depends on WebSocket Upgrade surviving the Cloudflare edge hop.
+          # cloudflared's auto/QUIC path has had upgrade propagation regressions,
+          # so use the TCP/HTTP2 edge transport and verify the public path before
+          # exposing the URL to a human tester.
+          cloudflared tunnel \
+            --protocol http2 \
+            --url http://127.0.0.1:3000 \
+            --loglevel info >"$tunnel_log" 2>&1 &
+          tunnel_pid=$!
+
+          cleanup_tunnel() {
+            kill "$tunnel_pid" 2>/dev/null || true
+            wait "$tunnel_pid" 2>/dev/null || true
+          }
+          trap cleanup_tunnel EXIT
+
+          tunnel_url=""
+          for attempt in {1..60}; do
+            if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+              cat "$tunnel_log"
+              echo "::error::cloudflared exited before publishing a quick-tunnel URL"
+              exit 1
+            fi
+            tunnel_url="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$tunnel_log" | tail -n 1 || true)"
+            if [ -n "$tunnel_url" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "$tunnel_url" ]; then
+            cat "$tunnel_log"
+            echo "::error::Timed out waiting for the Cloudflare quick-tunnel URL"
+            exit 1
           fi
+
+          remote_http_ready=0
+          for attempt in {1..60}; do
+            if curl -fsS \
+                 --connect-timeout 5 \
+                 --max-time 10 \
+                 -u "admin:${DESKTOP_PASSWORD}" \
+                 "${tunnel_url}/vnc.html" >/dev/null; then
+              remote_http_ready=1
+              break
+            fi
+            if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$remote_http_ready" -ne 1 ]; then
+            cat "$tunnel_log"
+            echo "::error::Public Cloudflare HTTP path never became reachable"
+            exit 1
+          fi
+
+          BASIC_AUTH="$(printf 'admin:%s' "$DESKTOP_PASSWORD" | base64 -w0)"
+          TUNNEL_URL="$tunnel_url" BASIC_AUTH="$BASIC_AUTH" python3 - <<'PY'
+          import base64
+          import os
+          import socket
+          import ssl
+          import time
+          from urllib.parse import urlparse
+
+          parsed = urlparse(os.environ["TUNNEL_URL"])
+          host = parsed.hostname
+          if not host:
+              raise SystemExit("invalid tunnel URL")
+
+          auth = os.environ["BASIC_AUTH"]
+          context = ssl.create_default_context()
+          last_status = b""
+          last_error = None
+
+          for attempt in range(30):
+              key = base64.b64encode(os.urandom(16)).decode("ascii")
+              request = (
+                  "GET /websockify HTTP/1.1\r\n"
+                  f"Host: {host}\r\n"
+                  "Upgrade: websocket\r\n"
+                  "Connection: Upgrade\r\n"
+                  f"Origin: https://{host}\r\n"
+                  f"Sec-WebSocket-Key: {key}\r\n"
+                  "Sec-WebSocket-Version: 13\r\n"
+                  "Sec-WebSocket-Protocol: binary\r\n"
+                  f"Authorization: Basic {auth}\r\n"
+                  "\r\n"
+              ).encode("ascii")
+
+              try:
+                  with socket.create_connection((host, 443), timeout=10) as raw:
+                      with context.wrap_socket(raw, server_hostname=host) as s:
+                          s.settimeout(10)
+                          s.sendall(request)
+                          response = b""
+                          while b"\r\n\r\n" not in response and len(response) < 65536:
+                              chunk = s.recv(4096)
+                              if not chunk:
+                                  break
+                              response += chunk
+                  status = response.split(b"\r\n", 1)[0]
+                  last_status = status
+                  if b" 101 " in status:
+                      print(status.decode("ascii", errors="replace"))
+                      break
+              except OSError as exc:
+                  last_error = exc
+
+              time.sleep(1)
+          else:
+              if last_status:
+                  raise SystemExit(f"public websocket upgrade failed: {last_status!r}")
+              raise SystemExit(f"public websocket upgrade failed: {last_error!r}")
+          PY
+
+          echo "::notice title=Desktop URL::${tunnel_url}"
+          echo "Authenticate with user: admin"
+          echo "Public HTTP and WebSocket smoke checks passed."
+
+          hold_checks=$((HOLD_MINUTES * 12))
+          for ((attempt=0; attempt<hold_checks; attempt++)); do
+            if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+              cat "$tunnel_log"
+              echo "::error::cloudflared exited while the desktop was being held open"
+              exit 1
+            fi
+            sleep 5
+          done
 
       - cancel: target-runner
 
