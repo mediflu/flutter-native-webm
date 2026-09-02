@@ -19,7 +19,7 @@ permissions:
 
 concurrency:
   group: desktop-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   desktop:
@@ -38,12 +38,14 @@ jobs:
           test -n "$RUNNER_ADMIN_TOKEN" || { echo "::error::Missing RUNNER_ADMIN_TOKEN"; exit 1; }
 
       - name: Install native desktop and development tools
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
 
-          sudo apt-get update
-          sudo apt-get install -y \
+          APT_OPTS=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          sudo apt-get "${APT_OPTS[@]}" update
+          sudo apt-get "${APT_OPTS[@]}" install -y \
             apache2-utils \
             ca-certificates \
             curl \
@@ -63,17 +65,17 @@ jobs:
             xfwm4
 
           if ! command -v google-chrome >/dev/null 2>&1; then
-            curl -fsSL \
+            curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 \
               https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
               -o /tmp/google-chrome.deb
-            sudo apt-get install -y /tmp/google-chrome.deb
+            sudo apt-get "${APT_OPTS[@]}" install -y /tmp/google-chrome.deb
           fi
 
           if ! command -v code >/dev/null 2>&1; then
-            curl -fL \
+            curl -fL --connect-timeout 15 --max-time 180 --retry 3 \
               https://update.code.visualstudio.com/latest/linux-deb-x64/stable \
               -o /tmp/vscode.deb
-            sudo apt-get install -y /tmp/vscode.deb
+            sudo apt-get "${APT_OPTS[@]}" install -y /tmp/vscode.deb
           fi
 
       - name: Configure native XFCE desktop
