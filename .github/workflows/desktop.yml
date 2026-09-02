@@ -45,7 +45,7 @@ jobs:
 
           APT_OPTS=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
           sudo apt-get "${APT_OPTS[@]}" update
-          sudo apt-get "${APT_OPTS[@]}" install -y \
+          sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
             apache2-utils \
             ca-certificates \
             curl \
@@ -68,14 +68,14 @@ jobs:
             curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 \
               https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
               -o /tmp/google-chrome.deb
-            sudo apt-get "${APT_OPTS[@]}" install -y /tmp/google-chrome.deb
+            sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends /tmp/google-chrome.deb
           fi
 
           if ! command -v code >/dev/null 2>&1; then
             curl -fL --connect-timeout 15 --max-time 180 --retry 3 \
               https://update.code.visualstudio.com/latest/linux-deb-x64/stable \
               -o /tmp/vscode.deb
-            sudo apt-get "${APT_OPTS[@]}" install -y /tmp/vscode.deb
+            sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends /tmp/vscode.deb
           fi
 
       - name: Configure native XFCE desktop
