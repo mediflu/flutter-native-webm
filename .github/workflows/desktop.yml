@@ -166,18 +166,56 @@ jobs:
           sudo nginx -t
           sudo systemctl daemon-reload
           sudo systemctl restart nginx
-          sudo systemctl start desktop-x.service desktop-xfce.service desktop-novnc.service
 
+          # systemd After= only orders process startup. It does not mean Xtigervnc
+          # is already listening, so do not start XFCE/websockify until RFB is ready.
+          sudo systemctl start desktop-x.service
+          vnc_ready=0
           for attempt in {1..30}; do
-            if curl -fsS -u "admin:${DESKTOP_PASSWORD}" \
-              http://127.0.0.1:3000/vnc.html >/dev/null; then
-              exit 0
+            if python3 - <<'PY'
+          import socket
+          try:
+              with socket.create_connection(("127.0.0.1", 5901), timeout=1) as s:
+                  banner = s.recv(12)
+              raise SystemExit(0 if banner.startswith(b"RFB ") else 1)
+          except OSError:
+              raise SystemExit(1)
+          PY
+            then
+              vnc_ready=1
+              break
             fi
             sleep 1
           done
 
-          sudo systemctl status desktop-x.service desktop-xfce.service desktop-novnc.service nginx --no-pager -l || true
-          exit 1
+          if [ "$vnc_ready" -ne 1 ]; then
+            sudo systemctl status desktop-x.service --no-pager -l || true
+            sudo journalctl -u desktop-x.service --no-pager -n 100 || true
+            exit 1
+          fi
+
+          sudo systemctl start desktop-xfce.service desktop-novnc.service
+
+          desktop_ready=0
+          for attempt in {1..30}; do
+            if curl -fsS -u "admin:${DESKTOP_PASSWORD}" \
+                 http://127.0.0.1:3000/vnc.html >/dev/null && \
+               curl -fsS -u "admin:${DESKTOP_PASSWORD}" \
+                 http://127.0.0.1:3000/app/ui.js >/dev/null && \
+               sudo systemctl is-active --quiet desktop-x.service && \
+               sudo systemctl is-active --quiet desktop-xfce.service && \
+               sudo systemctl is-active --quiet desktop-novnc.service; then
+              desktop_ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$desktop_ready" -ne 1 ]; then
+            sudo systemctl status desktop-x.service desktop-xfce.service desktop-novnc.service nginx --no-pager -l || true
+            sudo journalctl -u desktop-x.service -u desktop-xfce.service -u desktop-novnc.service --no-pager -n 100 || true
+            exit 1
+          fi
 
       - name: Verify noVNC path
         env:
@@ -351,12 +389,18 @@ jobs:
 
       - name: Remove target repository runner registration
         if: always()
-        working-directory: ${{ runner.temp }}/target-runner
         env:
           RUNNER_TARGET_REPOSITORY: ${{ secrets.RUNNER_TARGET_REPOSITORY }}
           RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
         run: |
           set +e
+          RUNNER_DIR="$RUNNER_TEMP/target-runner"
+          if [ ! -d "$RUNNER_DIR" ]; then
+            echo "Target runner directory was never created; skipping deregistration."
+            exit 0
+          fi
+          cd "$RUNNER_DIR"
+
           REMOVE_TOKEN="$(curl -fsSL \
             -X POST \
             -H 'Accept: application/vnd.github+json' \
