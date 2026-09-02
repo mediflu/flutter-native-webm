@@ -201,6 +201,33 @@ jobs:
 
           sudo systemctl start desktop-xfce.service desktop-novnc.service
 
+          # systemd can report the websockify unit active before its TCP listener
+          # is accepting connections. Wait for 6080 explicitly so the next smoke
+          # step cannot race the websocket bridge startup.
+          novnc_ready=0
+          for attempt in {1..30}; do
+            if python3 - <<'PY'
+          import socket
+          try:
+              with socket.create_connection(("127.0.0.1", 6080), timeout=1):
+                  pass
+              raise SystemExit(0)
+          except OSError:
+              raise SystemExit(1)
+          PY
+            then
+              novnc_ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$novnc_ready" -ne 1 ]; then
+            sudo systemctl status desktop-novnc.service --no-pager -l || true
+            sudo journalctl -u desktop-novnc.service --no-pager -n 100 || true
+            exit 1
+          fi
+
           desktop_ready=0
           for attempt in {1..30}; do
             if curl -fsS -u "admin:${DESKTOP_PASSWORD}" \
@@ -248,28 +275,43 @@ jobs:
           import base64
           import os
           import socket
+          import time
 
-          key = base64.b64encode(os.urandom(16)).decode("ascii")
           auth = os.environ["BASIC_AUTH"]
-          request = (
-              "GET /websockify HTTP/1.1\r\n"
-              "Host: 127.0.0.1\r\n"
-              "Upgrade: websocket\r\n"
-              "Connection: Upgrade\r\n"
-              f"Sec-WebSocket-Key: {key}\r\n"
-              "Sec-WebSocket-Version: 13\r\n"
-              f"Authorization: Basic {auth}\r\n"
-              "\r\n"
-          ).encode("ascii")
+          last_status = b""
+          last_error = None
 
-          s = socket.create_connection(("127.0.0.1", 3000), timeout=5)
-          s.sendall(request)
-          response = s.recv(4096)
-          s.close()
-          status = response.split(b"\r\n", 1)[0]
-          print(status.decode("ascii", errors="replace"))
-          if b" 101 " not in status:
-              raise SystemExit(f"websocket upgrade failed: {status!r}")
+          for attempt in range(30):
+              key = base64.b64encode(os.urandom(16)).decode("ascii")
+              request = (
+                  "GET /websockify HTTP/1.1\r\n"
+                  "Host: 127.0.0.1\r\n"
+                  "Upgrade: websocket\r\n"
+                  "Connection: Upgrade\r\n"
+                  f"Sec-WebSocket-Key: {key}\r\n"
+                  "Sec-WebSocket-Version: 13\r\n"
+                  "Sec-WebSocket-Protocol: binary\r\n"
+                  f"Authorization: Basic {auth}\r\n"
+                  "\r\n"
+              ).encode("ascii")
+
+              try:
+                  with socket.create_connection(("127.0.0.1", 3000), timeout=5) as s:
+                      s.sendall(request)
+                      response = s.recv(4096)
+                  status = response.split(b"\r\n", 1)[0]
+                  last_status = status
+                  if b" 101 " in status:
+                      print(status.decode("ascii", errors="replace"))
+                      break
+              except OSError as exc:
+                  last_error = exc
+
+              time.sleep(1)
+          else:
+              if last_status:
+                  raise SystemExit(f"websocket upgrade failed: {last_status!r}")
+              raise SystemExit(f"websocket upgrade failed: {last_error!r}")
           PY
 
           for attempt in {1..30}; do
