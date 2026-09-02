@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop
+  group: desktop-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -353,7 +353,7 @@ jobs:
             --disableupdate \
             --url "https://github.com/${RUNNER_TARGET_REPOSITORY}" \
             --token "$REGISTRATION_TOKEN" \
-            --name flutter-native-webm-desktop \
+            --name "flutter-native-webm-desktop-${GITHUB_RUN_ID}" \
             --labels webm-integration,ephemeral-linux \
             --work _work
 
