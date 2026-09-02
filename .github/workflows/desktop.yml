@@ -8,6 +8,9 @@ on:
         required: false
         default: '340'
         type: string
+  push:
+    branches:
+      - fix/novnc-remote-smoke
   schedule:
     - cron: '17 */6 * * *'
 
@@ -362,7 +365,7 @@ jobs:
 
       - name: Desktop URL
         env:
-          HOLD_MINUTES: ${{ inputs.hold_minutes || '340' }}
+          HOLD_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.hold_minutes || '10' }}
         run: |
           set -euo pipefail
           case "$HOLD_MINUTES" in
